@@ -140,112 +140,58 @@ impl CMDUHandler {
         );
 
         let message_id = cmdu.message_id;
-
         let tlvs = match cmdu.get_tlvs() {
             Ok(t) => t,
-            Err(e) => {
-                tracing::error!("Failed to parse TLVs (msg_id={}): {:?}", message_id, e);
-                return;
-            }
+            Err(e) => return error!(message_id, %e, "Failed to parse TLVs"),
         };
 
-        match CMDUType::from_u16(cmdu.message_type) {
+        let handled = match CMDUType::from_u16(cmdu.message_type) {
             CMDUType::TopologyDiscovery => {
-                self.handle_topology_discovery(
-                    &tlvs,
-                    message_id,
-                    source_mac,
-                    local_interface_mac,
-                ).await;
+                self.handle_topology_discovery(&tlvs, message_id, source_mac, local_interface_mac)
+                    .await;
+                true
             }
             CMDUType::TopologyNotification => {
-                let handled = self.handle_topology_notification(
+                self.handle_topology_notification(
                     &tlvs,
                     message_id,
                     source_mac,
                     local_interface_mac,
-                ).await;
-
-                if !handled {
-                    if let Err(e) = self
-                        .handle_sdu_from_cmdu_reception(
-                            &tlvs,
-                            message_id,
-                            cmdu.message_type,
-                            source_mac,
-                            destination_mac,
-                        )
-                        .await
-                    {
-                        error!(%e, "Error forwarding SDU from TopologyNotification interoperability (msg_id={message_id})");
-                    }
-                }
+                )
+                .await
             }
             CMDUType::TopologyQuery => {
-                let handled = self.handle_topology_query(
-                    &tlvs,
-                    message_id,
-                    source_mac,
-                    local_interface_mac,
-                ).await;
-
-                if !handled {
-                    if let Err(e) = self
-                        .handle_sdu_from_cmdu_reception(
-                            &tlvs,
-                            message_id,
-                            cmdu.message_type,
-                            source_mac,
-                            destination_mac,
-                        )
-                        .await
-                    {
-                        error!(%e, "Error forwarding SDU from TopologyQuery interoperability (msg_id={message_id})");
-                    }
-                }
+                self.handle_topology_query(&tlvs, message_id, source_mac, local_interface_mac)
+                    .await
             }
             CMDUType::TopologyResponse => {
-                let handled = self.handle_topology_response(
-                    &tlvs,
-                    message_id,
-                    source_mac,
-                    local_interface_mac,
-                ).await;
-
-                if !handled {
-                    if let Err(e) = self
-                        .handle_sdu_from_cmdu_reception(
-                            &tlvs,
-                            message_id,
-                            cmdu.message_type,
-                            source_mac,
-                            destination_mac,
-                        )
-                        .await
-                    {
-                        error!(%e, "Error forwarding SDU from TopologyResponse interoperability (msg_id={message_id})");
-                    }
-                }
+                self.handle_topology_response(&tlvs, message_id, source_mac, local_interface_mac)
+                    .await
             }
             CMDUType::LinkMetricQuery => {
-                tracing::info!("Handling Link Metric Query CMDU");
+                self.handle_link_metric_query(&tlvs, message_id, source_mac)
+                    .await;
+                true
             }
             CMDUType::LinkMetricResponse => {
-                tracing::info!("Handling Link Metric Response CMDU");
+                info!("Handling Link Metric Response CMDU");
+                true
             }
-            _ => {
-                if let Err(e) = self
-                    .handle_sdu_from_cmdu_reception(
-                        &tlvs,
-                        message_id,
-                        cmdu.message_type,
-                        source_mac,
-                        destination_mac,
-                    )
-                    .await
-                {
-                    error!(%e, "Error forwarding SDU from CMDU (msg_id={message_id})");
-                }
+            _ => false,
+        };
+
+        if !handled {
+            if let Err(e) = self
+                .handle_sdu_from_cmdu_reception(
+                    &tlvs,
+                    message_id,
+                    cmdu.message_type,
+                    source_mac,
+                    destination_mac,
+                )
+                .await
+            {
+                error!(message_id, %e, "Error forwarding SDU from CMDU");
             }
         }
     }
@@ -587,8 +533,10 @@ impl CMDUHandler {
                                     bridging_tuple: None,
                                     vlan: None,
                                     metric: None,
+                                    phy_rate: None,
                                     non_ieee1905_neighbors: None,
                                     ieee1905_neighbors: None,
+                                    link_stats: Default::default(),
                                 },
                             ));
                         }
@@ -889,6 +837,62 @@ impl CMDUHandler {
         };
 
         !result.converged // don't consume message if we have converged
+    }
+
+    /// Handles and logs TLVs for Link Metric Query.
+    #[instrument(skip_all, name = "link_metric_query")]
+    async fn handle_link_metric_query(&self, tlvs: &[TLV], message_id: u16, source_mac: MacAddr) {
+        debug!(
+            source = %source_mac,
+            msg_id = message_id,
+            interface = self.interface_name,
+            "Handling Link Metric Query CMDU",
+        );
+
+        let mut query = None;
+
+        for (index, tlv) in tlvs.iter().enumerate() {
+            let tlv_type = IEEE1905TLVType::from_u8(tlv.tlv_type);
+            debug!(index, ?tlv_type, length = tlv.tlv_length, "Processing TLV");
+
+            if let IEEE1905TLVType::LinkMetricQuery = tlv_type {
+                if let Some(ref value) = tlv.tlv_value {
+                    if let Ok((_, parsed)) = LinkMetricQuery::parse(value) {
+                        query = Some(parsed);
+                        debug!("Extracted LinkMetricQuery: {query:?}");
+                    }
+                }
+            }
+        }
+
+        let Some(query) = query else {
+            error!("Link Metric Query CMDU missing LinkMetricQuery TLV → discarding message.");
+            return;
+        };
+
+        let topology_db =
+            TopologyDatabase::get_instance(self.local_al_mac, self.interface_name.clone()).await;
+
+        let result = topology_db
+            .handle_link_metric_query(source_mac, &query)
+            .await;
+
+        info!(source = %source_mac, "Link Metric Query Processed");
+
+        if let Some((remote_al_mac, neighbors)) = result {
+            tokio::spawn(cmdu_link_metric_response_transmission(
+                self.interface_name.clone(),
+                self.sender.clone(),
+                message_id,
+                self.local_al_mac,
+                remote_al_mac,
+                query.requested_metrics != LinkMetricQuery::METRIC_TX,
+                query.requested_metrics != LinkMetricQuery::METRIC_RX,
+                neighbors,
+            ));
+        } else {
+            debug!("No transmission event triggered by Link Metric Query");
+        }
     }
 
     #[instrument(skip_all, name = "sdu_from_cmdu")]

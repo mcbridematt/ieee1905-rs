@@ -44,12 +44,13 @@ use indexmap::IndexMap;
 use std::{io, sync::Arc};
 use tokio::task::JoinSet;
 // Internal modules
-use crate::cmdu_codec::{MediaType, MediaTypeSpecialInfo};
+use crate::cmdu_codec::{LinkMetricQuery, MediaType, MediaTypeSpecialInfo};
 use crate::interface_manager::get_interfaces;
 use crate::lldpdu::PortId;
 use crate::{
     cmdu::IEEE1905Neighbor, interface_manager::get_forwarding_interface_mac, next_task_id,
 };
+use crate::linux::if_link::RtnlLinkStats64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateLocal {
@@ -97,9 +98,12 @@ pub struct Ieee1905InterfaceData {
     pub bridging_tuple: Option<u32>,
     pub vlan: Option<u16>,
     pub metric: Option<u16>,
+    pub phy_rate: Option<u64>,
     pub non_ieee1905_neighbors: Option<Vec<MacAddr>>,
     pub ieee1905_neighbors: Option<Vec<IEEE1905Neighbor>>,
+    pub link_stats: RtnlLinkStats64,
 }
+
 impl Ieee1905InterfaceData {
     pub fn new(
         mac: MacAddr,
@@ -119,8 +123,10 @@ impl Ieee1905InterfaceData {
             bridging_tuple,
             vlan,
             metric,
+            phy_rate: None,
             non_ieee1905_neighbors,
             ieee1905_neighbors,
+            link_stats: Default::default(),
         }
     }
 
@@ -301,8 +307,24 @@ impl Ieee1905DeviceData {
             self.local_interface_list = Some(interfaces);
         }
     }
+
     pub fn has_changed(&self, other: &Self) -> bool {
         self.local_interface_list != other.local_interface_list
+    }
+
+    pub fn has_port(&self, mac: MacAddr) -> bool {
+        if self.al_mac == mac {
+            return true;
+        }
+        if self.destination_frame_mac == mac {
+            return true;
+        }
+        if self.destination_mac == Some(mac) {
+            return true;
+        }
+        self.local_interface_list
+            .as_ref()
+            .is_some_and(|e| e.iter().any(|e| e.mac == mac))
     }
 }
 
@@ -420,21 +442,7 @@ impl TopologyDatabase {
         let nodes = self.nodes.read().await;
         nodes
             .values()
-            .find(|node| {
-                if node.device_data.al_mac == mac {
-                    return true;
-                }
-                if node.device_data.destination_frame_mac == mac {
-                    return true;
-                }
-                if node.device_data.destination_mac == Some(mac) {
-                    return true;
-                }
-                node.device_data
-                    .local_interface_list
-                    .as_ref()
-                    .is_some_and(|interfaces| interfaces.iter().any(|e| e.mac == mac))
-            })
+            .find(|node| node.device_data.has_port(mac))
             .cloned()
     }
 
@@ -791,6 +799,35 @@ impl TopologyDatabase {
         }
     }
 
+    pub async fn handle_link_metric_query(
+        &self,
+        source: MacAddr,
+        query: &LinkMetricQuery,
+    ) -> Option<(MacAddr, Vec<Ieee1905Node>)> {
+        let nodes = self.nodes.write().await;
+        let Some((al_mac, _)) = nodes.iter().find(|e| e.1.device_data.has_port(source)) else {
+            debug!(%source, "link_metric_query — node not found");
+            return None;
+        };
+
+        let neighbors = match query.neighbor_mac {
+            Some(e) => {
+                let Some(neighbor) = nodes.get(&e) else {
+                    debug!(%source, "link_metric_query — neighbor {e} not found");
+                    return None;
+                };
+                vec![neighbor.clone()]
+            }
+            None => nodes
+                .iter()
+                .filter(|e| e.0 != al_mac)
+                .map(|e| e.1.clone())
+                .collect(),
+        };
+
+        Some((*al_mac, neighbors))
+    }
+
     pub async fn start_topology_cli(self: Arc<Self>) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -967,8 +1004,10 @@ mod tests {
             bridging_tuple: None,
             vlan: None,
             metric: None,
+            phy_rate: None,
             non_ieee1905_neighbors: None,
             ieee1905_neighbors: None,
+            link_stats: Default::default(),
         };
         let device = Ieee1905DeviceData::new(
             device_al_mac,

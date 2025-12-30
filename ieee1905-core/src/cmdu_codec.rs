@@ -1127,7 +1127,7 @@ impl LinkMetricTx {
 pub struct LinkMetricTxPair {
     pub receiver_interface_mac: MacAddr,
     pub neighbour_interface_mac: MacAddr,
-    pub interface_type: u16,
+    pub interface_type: MediaType,
     pub has_more_ieee802_bridges: u8,
     pub packet_errors: u32,
     pub transmitted_packets: u32,
@@ -1140,7 +1140,7 @@ impl LinkMetricTxPair {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, receiver_interface_mac) = take_mac_addr(input)?;
         let (input, neighbour_interface_mac) = take_mac_addr(input)?;
-        let (input, interface_type) = be_u16(input)?;
+        let (input, interface_type) = MediaType::parse(input)?;
         let (input, has_more_ieee802_bridges) = be_u8(input)?;
         let (input, packet_errors) = be_u32(input)?;
         let (input, transmitted_packets) = be_u32(input)?;
@@ -1168,7 +1168,7 @@ impl LinkMetricTxPair {
         let mut vec = Vec::new();
         vec.extend(self.receiver_interface_mac.octets());
         vec.extend(self.neighbour_interface_mac.octets());
-        vec.extend(self.interface_type.to_be_bytes());
+        vec.extend(self.interface_type.serialize());
         vec.extend(self.has_more_ieee802_bridges.to_be_bytes());
         vec.extend(self.packet_errors.to_be_bytes());
         vec.extend(self.transmitted_packets.to_be_bytes());
@@ -1220,7 +1220,7 @@ impl LinkMetricRx {
 pub struct LinkMetricRxPair {
     pub receiver_interface_mac: MacAddr,
     pub neighbour_interface_mac: MacAddr,
-    pub interface_type: u16,
+    pub interface_type: MediaType,
     pub packet_errors: u32,
     pub transmitted_packets: u32,
     pub rssi: u8,
@@ -1230,7 +1230,7 @@ impl LinkMetricRxPair {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, receiver_interface_mac) = take_mac_addr(input)?;
         let (input, neighbour_interface_mac) = take_mac_addr(input)?;
-        let (input, interface_type) = be_u16(input)?;
+        let (input, interface_type) = MediaType::parse(input)?;
         let (input, packet_errors) = be_u32(input)?;
         let (input, transmitted_packets) = be_u32(input)?;
         let (input, rssi) = be_u8(input)?;
@@ -1252,7 +1252,7 @@ impl LinkMetricRxPair {
         let mut vec = Vec::new();
         vec.extend(self.receiver_interface_mac.octets());
         vec.extend(self.neighbour_interface_mac.octets());
-        vec.extend(self.interface_type.to_be_bytes());
+        vec.extend(self.interface_type.serialize());
         vec.extend(self.packet_errors.to_be_bytes());
         vec.extend(self.transmitted_packets.to_be_bytes());
         vec.extend(self.rssi.to_be_bytes());
@@ -2957,7 +2957,7 @@ pub mod tests {
             pair.neighbour_interface_mac,
             MacAddr::new(0x70, 0x71, 0x72, 0x73, 0x74, 0x77)
         );
-        assert_eq!(pair.interface_type, 1);
+        assert_eq!(pair.interface_type, MediaType::ETHERNET_802_3ab);
         assert_eq!(pair.has_more_ieee802_bridges, 0);
         assert_eq!(pair.packet_errors, 0x13);
         assert_eq!(pair.transmitted_packets, 0x42);
@@ -3002,7 +3002,7 @@ pub mod tests {
             pair.neighbour_interface_mac,
             MacAddr::new(0x70, 0x71, 0x72, 0x73, 0x74, 0x77)
         );
-        assert_eq!(pair.interface_type, 1);
+        assert_eq!(pair.interface_type, MediaType::ETHERNET_802_3ab);
         assert_eq!(pair.packet_errors, 0x13);
         assert_eq!(pair.transmitted_packets, 0x42);
         assert_eq!(pair.rssi, 0x10);

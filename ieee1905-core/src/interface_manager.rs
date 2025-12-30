@@ -25,6 +25,9 @@ use pnet::datalink::{self, MacAddr};
 
 // Standard library
 use crate::cmdu_codec::{MediaType, MediaTypeSpecialInfo, MediaTypeSpecialInfoWifi};
+use crate::linux::eth_tool::{
+    EthToolHeaderAttribute, EthToolLinkModesAttribute, EthToolMessage, ETH_TOOL_GENL_NAME,
+};
 use crate::linux::if_link::{RtnlLinkStats, RtnlLinkStats64};
 use crate::linux::nl80211::{
     Nl80211Attribute, Nl80211ChannelWidth, Nl80211Command, Nl80211IfType, Nl80211RateInfo,
@@ -235,8 +238,10 @@ pub async fn get_interfaces() -> anyhow::Result<Vec<Ieee1905InterfaceData>> {
             bridging_tuple: ethernet.bridge_if_index,
             vlan: ethernet.vlan_id,
             metric: None,
+            phy_rate: Some(1_000_000),
             non_ieee1905_neighbors: None,
             ieee1905_neighbors: None,
+            link_stats: ethernet.link_stats,
         };
         interfaces.insert(ethernet.if_index, (interface, ethernet));
     }
@@ -262,6 +267,7 @@ pub async fn get_interfaces() -> anyhow::Result<Vec<Ieee1905InterfaceData>> {
             continue;
         }
         interface.media_type = wireless.media_type;
+        interface.phy_rate = Some(wireless.phy_rate);
         interface.media_type_extra = MediaTypeSpecialInfo::Wifi(MediaTypeSpecialInfoWifi {
             bssid: wireless.bssid.unwrap_or_default(),
             role: convert_if_type_to_role(wireless.if_type, wireless.frequency).unwrap_or_default(),
@@ -282,6 +288,7 @@ struct LinkEthernetInfo {
     if_name: String,
     bridge_if_index: Option<u32>,
     vlan_id: Option<u16>,
+    link_stats: RtnlLinkStats64,
 }
 
 async fn get_all_interfaces() -> anyhow::Result<Vec<LinkEthernetInfo>> {
@@ -318,19 +325,6 @@ async fn get_all_interfaces() -> anyhow::Result<Vec<LinkEthernetInfo>> {
             continue;
         };
 
-        if let Ok(stats) = attr_handle.get_attr_payload_as_with_len_borrowed::<&[u8]>(Ifla::Stats) {
-            debug_assert_eq!(stats.len(), size_of::<RtnlLinkStats>());
-            let _stats =
-                unsafe { std::ptr::read_unaligned(stats.as_ptr().cast::<RtnlLinkStats>()) };
-        }
-
-        if let Ok(stats) = attr_handle.get_attr_payload_as_with_len_borrowed::<&[u8]>(Ifla::Stats64)
-        {
-            debug_assert_eq!(stats.len(), size_of::<RtnlLinkStats64>());
-            let _stats =
-                unsafe { std::ptr::read_unaligned(stats.as_ptr().cast::<RtnlLinkStats64>()) };
-        }
-
         fn get_vlan_id(handle: &RtAttrHandle<Ifla>) -> Option<u16> {
             let link_info = handle
                 .get_nested_attributes::<IflaInfo>(Ifla::Linkinfo)
@@ -350,6 +344,7 @@ async fn get_all_interfaces() -> anyhow::Result<Vec<LinkEthernetInfo>> {
         let if_index = i32::from(*payload.ifi_index());
         let vlan_id = get_vlan_id(&attr_handle);
         let bridge_if_index = attr_handle.get_attr_payload_as(Ifla::Master).ok();
+        let link_stats = get_link_stats(&attr_handle);
 
         interfaces.push(LinkEthernetInfo {
             mac: MacAddr::from(mac),
@@ -357,6 +352,7 @@ async fn get_all_interfaces() -> anyhow::Result<Vec<LinkEthernetInfo>> {
             if_name,
             bridge_if_index,
             vlan_id,
+            link_stats: link_stats.unwrap_or_default(),
         });
     }
 
@@ -370,6 +366,7 @@ struct WirelessInterfaceInfo {
     if_index: i32,
     if_name: String,
     if_type: Option<Nl80211IfType>,
+    phy_rate: u64,
     frequency: u32,
     channel_width: Option<Nl80211ChannelWidth>,
     center_freq_index1: Option<u8>,
@@ -381,7 +378,8 @@ async fn get_wireless_interfaces() -> anyhow::Result<Vec<WirelessInterfaceInfo>>
     let socket = NlRouter::connect(NlFamily::Generic, None, Groups::empty())
         .await?
         .0;
-    let family_id = socket.resolve_genl_family(NL80211_GENL_NAME).await?;
+    let nl80211_family_id = socket.resolve_genl_family(NL80211_GENL_NAME).await?;
+    let eth_tool_family_id = socket.resolve_genl_family(ETH_TOOL_GENL_NAME).await?;
 
     let nl_message_attrs = NlattrBuilder::default()
         .nla_type(
@@ -401,7 +399,7 @@ async fn get_wireless_interfaces() -> anyhow::Result<Vec<WirelessInterfaceInfo>>
     let mut recv: NlRouterReceiverHandle<GenlId, Genlmsghdr<Nl80211Command, Nl80211Attribute>> =
         socket
             .send(
-                family_id,
+                nl80211_family_id,
                 NlmF::DUMP | NlmF::ACK,
                 NlPayload::Payload(nl_message),
             )
@@ -445,6 +443,7 @@ async fn get_wireless_interfaces() -> anyhow::Result<Vec<WirelessInterfaceInfo>>
             if_index,
             if_name,
             if_type,
+            phy_rate: 1_000_000,
             frequency,
             channel_width,
             center_freq_index1: center_freq1.and_then(get_wifi_center_frequency_index),
@@ -472,7 +471,7 @@ async fn get_wireless_interfaces() -> anyhow::Result<Vec<WirelessInterfaceInfo>>
         let mut recv: NlRouterReceiverHandle<GenlId, Genlmsghdr<Nl80211Command, Nl80211Attribute>> =
             socket
                 .send(
-                    family_id,
+                    nl80211_family_id,
                     NlmF::DUMP | NlmF::ACK,
                     NlPayload::Payload(nl_message),
                 )
@@ -493,20 +492,92 @@ async fn get_wireless_interfaces() -> anyhow::Result<Vec<WirelessInterfaceInfo>>
             if let Ok(sta_info) =
                 handle.get_nested_attributes::<Nl80211StaInfo>(Nl80211Attribute::StaInfo)
             {
-                if let Ok(rate_info) =
-                    sta_info.get_nested_attributes::<Nl80211RateInfo>(Nl80211StaInfo::TxBitrate)
-                {
-                    interface.media_type = get_wireless_media_type(interface.frequency, &rate_info);
+                if let Ok(rate_info) = sta_info.get_nested_attributes(Nl80211StaInfo::TxBitrate) {
+                    let bitrate = get_station_bitrate_bps(&rate_info).unwrap_or_default();
+                    interface.phy_rate = bitrate;
+                    interface.media_type = get_wireless_media_type(
+                        interface.frequency,
+                        interface.phy_rate,
+                        &rate_info,
+                    );
                 }
             }
         }
     }
 
+    let nl_dev_name_attrs = NlattrBuilder::default()
+        .nla_type(
+            AttrTypeBuilder::default()
+                .nla_type(EthToolHeaderAttribute::DevName)
+                .build()?,
+        )
+        .nla_payload(())
+        .build()?;
+
+    let nl_header_attrs = NlattrBuilder::default()
+        .nla_type(
+            AttrTypeBuilder::default()
+                .nla_type(EthToolLinkModesAttribute::Header)
+                .build()?,
+        )
+        .nla_payload(nl_dev_name_attrs)
+        .build()?;
+
+    let nl_message = GenlmsghdrBuilder::default()
+        .cmd(EthToolMessage::LinkModesGet)
+        .attrs(GenlBuffer::from_iter([nl_header_attrs]))
+        .version(1)
+        .build()?;
+
+    let mut recv = socket
+        .send::<_, _, GenlId, Genlmsghdr<EthToolMessage, EthToolLinkModesAttribute>>(
+            eth_tool_family_id,
+            NlmF::DUMP | NlmF::ACK,
+            NlPayload::Payload(nl_message),
+        )
+        .await?;
+
+    while let Some(message) = recv.next().await {
+        let message: Nlmsghdr<GenlId, Genlmsghdr<EthToolMessage, EthToolLinkModesAttribute>> = message.unwrap();
+        let Some(payload) = message.get_payload() else {
+            continue;
+        };
+        let a = payload;
+        let _ = a;
+    }
+
     Ok(interfaces)
+}
+
+fn get_link_stats(handle: &RtAttrHandle<Ifla>) -> Option<RtnlLinkStats64> {
+    if let Ok(stats) = handle.get_attr_payload_as_with_len_borrowed::<&[u8]>(Ifla::Stats64) {
+        debug_assert_eq!(stats.len(), size_of::<RtnlLinkStats64>());
+        unsafe {
+            return Some(std::ptr::read_unaligned(stats.as_ptr().cast()));
+        }
+    }
+    if let Ok(stats) = handle.get_attr_payload_as_with_len_borrowed::<&[u8]>(Ifla::Stats) {
+        debug_assert_eq!(stats.len(), size_of::<RtnlLinkStats>());
+        unsafe {
+            return Some(std::ptr::read_unaligned(stats.as_ptr().cast::<RtnlLinkStats>()).into());
+        }
+    }
+    None
+}
+
+fn get_station_bitrate_bps(handle: &GenlAttrHandle<Nl80211RateInfo>) -> Option<u64> {
+    if let Ok(bitrate) = handle.get_attr_payload_as::<u32>(Nl80211RateInfo::Bitrate32) {
+        return Some(u64::from(bitrate) * 100_000);
+    }
+    if let Ok(bitrate) = handle.get_attr_payload_as::<u16>(Nl80211RateInfo::Bitrate) {
+        return Some(u64::from(bitrate) * 100_000);
+    }
+    None
 }
 
 fn get_wireless_media_type(
     frequency: u32,
+    bitrate: u64,
     rate_info: &GenlAttrHandle<Nl80211RateInfo>,
 ) -> MediaType {
     let is_2_4 = frequency < 3000;
@@ -545,10 +616,7 @@ fn get_wireless_media_type(
         return MediaType::WIRELESS_802_11a_5;
     }
 
-    let bitrate = rate_info
-        .get_attr_payload_as::<u32>(Nl80211RateInfo::Bitrate32)
-        .unwrap_or_default();
-    if bitrate > 11_0 {
+    if bitrate > 11_000_000 {
         // 802.11b
         MediaType::WIRELESS_802_11b_2_4
     } else {
